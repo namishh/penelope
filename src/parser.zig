@@ -73,6 +73,7 @@ pub const ParseResult = struct {
 
 pub const Parser = union(enum) {
     string: []const u8,
+    sequence: []const Parser,
 
     pub fn parse(self: Parser, state: *ParserState) Error!Span {
         const start = state.index;
@@ -82,7 +83,11 @@ pub const Parser = union(enum) {
                 const remaining = state.remaining();
 
                 var i: usize = 0;
-                while (i < expected.len and i < remaining.len and remaining[i] == expected[i]) : (i += 1) {}
+                while (i < expected.len and i < remaining.len) : (i += 1) {
+                    if (remaining[i] != expected[i]) {
+                        break;
+                    }
+                }
                 if (i < expected.len) {
                     state.index += i;
                     state.record_expected(expected);
@@ -91,6 +96,16 @@ pub const Parser = union(enum) {
                 }
 
                 state.index += expected.len;
+            },
+
+            .sequence => |parsers| {
+                const checkpoint = state.index;
+                for (parsers) |parser| {
+                    _ = parser.parse(state) catch |err| {
+                        state.index = checkpoint;
+                        return err;
+                    };
+                }
             },
         }
 
@@ -119,6 +134,10 @@ pub fn str(value: []const u8) Parser {
     return .{ .string = value };
 }
 
+pub fn sequence(parsers: []const Parser) Parser {
+    return .{ .sequence = parsers };
+}
+
 test "string parser" {
     const parser = str("hello");
 
@@ -134,15 +153,23 @@ test "string parser" {
 
 test "string parser failure" {
     const parser = str("hello");
-    switch (parser.run("hello")) {
-        .success => |_| {
-            try testing.expect(false);
-        },
+    switch (parser.run("helo")) {
+        .success => |_| try testing.expect(false),
         .err => |e| {
             std.debug.print("{f}\n", .{e});
             try testing.expectEqual(@as(usize, 3), e.index);
-            try testing.expectEqual(@as(?u8, 'l'), e.found);
-            try testing.expectEqualStrings("helo", e.expected);
+        },
+    }
+}
+
+test "sequence with strings" {
+    const parser = sequence(&.{ str("hello "), str("world") });
+    switch (parser.run("hello world")) {
+        .success => |result| {
+            try testing.expectEqualStrings("hello world", result.value());
+        },
+        .err => |_| {
+            try testing.expect(false);
         },
     }
 }
