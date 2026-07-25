@@ -72,6 +72,8 @@ pub const Parser = union(enum) {
     string: []const u8,
     sequence: []const Parser,
     choice: []const Parser,
+    many: *const Parser,
+    many1: *const Parser,
     digits,
     letters,
     lettersN: usize,
@@ -165,6 +167,47 @@ pub const Parser = union(enum) {
                 }
             },
 
+            .many => |parser| {
+                while (true) {
+                    const checkpoint = state.index;
+                    _ = parser.parse(state) catch |err| {
+                        switch (err) {
+                            error.CouldNotMatch => {
+                                state.index = checkpoint;
+                                break;
+                            },
+
+                            else => return err,
+                        }
+                    };
+
+                    if (state.index == checkpoint) {
+                        return error.ParserDidNotConsumeInput;
+                    }
+                }
+            },
+
+            .many1 => |parser| {
+                _ = try parser.parse(state);
+                while (true) {
+                    const checkpoint = state.index;
+                    _ = parser.parse(state) catch |err| {
+                        switch (err) {
+                            error.CouldNotMatch => {
+                                state.index = checkpoint;
+                                break;
+                            },
+
+                            else => return err,
+                        }
+                    };
+
+                    if (state.index == checkpoint) {
+                        return error.ParserDidNotConsumeInput;
+                    }
+                }
+            },
+
             .choice => |parsers| {
                 const checkpoint = state.index;
                 for (parsers) |parser| {
@@ -235,6 +278,14 @@ pub fn digitsN(n: usize) Parser {
 
 pub fn lettersN(n: usize) Parser {
     return .{ .lettersN = n };
+}
+
+pub fn many(p: *const Parser) Parser {
+    return .{ .many = p };
+}
+
+pub fn many1(p: *const Parser) Parser {
+    return .{ .many1 = p };
 }
 
 test "string parser" {
@@ -455,6 +506,18 @@ test "choices fail" {
         .err => |e| {
             try testing.expectEqual(@as(usize, 0), e.index);
             try testing.expectEqualStrings("hello", e.expected);
+        },
+    }
+}
+
+test "many" {
+    const parser = many(&digitsN(1));
+    switch (parser.run("12345")) {
+        .success => |result| {
+            try testing.expectEqualStrings("12345", result.value());
+        },
+        .err => |_| {
+            try testing.expect(false);
         },
     }
 }
