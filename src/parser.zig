@@ -12,11 +12,11 @@ pub const ParseError = struct {
     err: ?Error = null,
     index: usize,
     expected: []const u8,
-    found: ?u8,
+    found: []const u8,
 
     pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (self.found) |found| {
-            try writer.print("parse error at byte {d}: expected {s}, found '{c}'", .{ self.index, self.expected, found });
+        if (self.found.len > 0) {
+            try writer.print("parse error at byte {d}: expected {s}, found '{s}'", .{ self.index, self.expected, self.found });
         } else {
             try writer.print("parse error at byte {d}: expected {s}, found end of input", .{ self.index, self.expected });
         }
@@ -40,10 +40,7 @@ const ParserState = struct {
         const err = ParseError{
             .index = self.index,
             .expected = expected,
-            .found = if (self.index < self.input.len)
-                self.input[self.index]
-            else
-                null,
+            .found = self.input[self.index..],
         };
 
         if (self.error_info == null or err.index > self.error_info.?.index) {
@@ -82,19 +79,10 @@ pub const Parser = union(enum) {
             .string => |expected| {
                 const remaining = state.remaining();
 
-                var i: usize = 0;
-                while (i < expected.len and i < remaining.len) : (i += 1) {
-                    if (remaining[i] != expected[i]) {
-                        break;
-                    }
-                }
-                if (i < expected.len) {
-                    state.index += i;
+                if (remaining.len < expected.len or !std.mem.eql(u8, remaining[0..expected.len], expected)) {
                     state.record_expected(expected);
-                    state.index = start;
                     return error.CouldNotMatch;
                 }
-
                 state.index += expected.len;
             },
 
@@ -116,7 +104,7 @@ pub const Parser = union(enum) {
         var state = ParserState.init(input);
 
         const span = self.parse(&state) catch |err| {
-            const details = state.error_info orelse ParseError{ .index = state.index, .expected = "unknown", .found = null };
+            const details = state.error_info orelse ParseError{ .index = state.index, .expected = "unknown", .found = "" };
             var d = details;
             d.err = err;
             return .{ .err = d };
@@ -156,8 +144,9 @@ test "string parser failure" {
     switch (parser.run("helo")) {
         .success => |_| try testing.expect(false),
         .err => |e| {
-            std.debug.print("{f}\n", .{e});
-            try testing.expectEqual(@as(usize, 3), e.index);
+            try testing.expectEqual(@as(usize, 0), e.index);
+            try testing.expectEqualStrings("hello", e.expected);
+            try testing.expectEqualStrings("helo", e.found);
         },
     }
 }
@@ -170,6 +159,20 @@ test "sequence with strings" {
         },
         .err => |_| {
             try testing.expect(false);
+        },
+    }
+}
+
+test "failure sequence with strings" {
+    const parser = sequence(&.{ str("hello "), str("world") });
+    switch (parser.run("hello wold")) {
+        .success => |_| {
+            try testing.expect(false);
+        },
+        .err => |e| {
+            try testing.expectEqual(@as(usize, 6), e.index);
+            try testing.expectEqualStrings("world", e.expected);
+            try testing.expectEqualStrings("wold", e.found);
         },
     }
 }
