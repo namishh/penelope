@@ -16,9 +16,9 @@ pub const ParseError = struct {
 
     pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.found.len > 0) {
-            try writer.print("parse error at byte {d}: expected {s}, found '{s}'", .{ self.index, self.expected, self.found });
+            try writer.print("parse error at byte {d}: expected {s}, found '{s}'\n", .{ self.index, self.expected, self.found });
         } else {
-            try writer.print("parse error at byte {d}: expected {s}, found end of input", .{ self.index, self.expected });
+            try writer.print("parse error at byte {d}: expected {s}, found end of input\n", .{ self.index, self.expected });
         }
     }
 };
@@ -71,6 +71,9 @@ pub const ParseResult = struct {
 pub const Parser = union(enum) {
     string: []const u8,
     sequence: []const Parser,
+    digits,
+    letters,
+    eof,
 
     pub fn parse(self: Parser, state: *ParserState) Error!Span {
         const start = state.index;
@@ -84,6 +87,35 @@ pub const Parser = union(enum) {
                     return error.CouldNotMatch;
                 }
                 state.index += expected.len;
+            },
+
+            .letters => {
+                while (state.index < state.input.len and std.ascii.isAlphabetic(state.input[state.index])) {
+                    state.index += 1;
+                }
+
+                if (state.index == start) {
+                    state.record_expected("letter");
+                    return error.CouldNotMatch;
+                }
+            },
+
+            .eof => {
+                if (!(state.index >= state.input.len)) {
+                    state.record_expected("end of input");
+                    return error.CouldNotMatch;
+                }
+            },
+
+            .digits => {
+                while (state.index < state.input.len and std.ascii.isDigit(state.input[state.index])) {
+                    state.index += 1;
+                }
+
+                if (state.index == start) {
+                    state.record_expected("digit");
+                    return error.CouldNotMatch;
+                }
             },
 
             .sequence => |parsers| {
@@ -126,6 +158,18 @@ pub fn sequence(parsers: []const Parser) Parser {
     return .{ .sequence = parsers };
 }
 
+pub fn digits() Parser {
+    return .digits;
+}
+
+pub fn letters() Parser {
+    return .letters;
+}
+
+pub fn eof() Parser {
+    return .eof;
+}
+
 test "string parser" {
     const parser = str("hello");
 
@@ -151,6 +195,62 @@ test "string parser failure" {
     }
 }
 
+test "digits pass" {
+    const parser = digits();
+
+    switch (parser.run("1234")) {
+        .success => |result| {
+            try testing.expectEqualStrings("1234", result.value());
+        },
+        .err => |_| {
+            try testing.expect(false);
+        },
+    }
+}
+
+test "digits fail" {
+    const parser = digits();
+
+    switch (parser.run("a1234")) {
+        .success => |_| {
+            try testing.expect(false);
+        },
+        .err => |e| {
+            try testing.expectEqual(@as(usize, 0), e.index);
+            try testing.expectEqualStrings("digit", e.expected);
+            try testing.expectEqualStrings("a1234", e.found);
+        },
+    }
+}
+
+test "letters pass" {
+    const parser = letters();
+
+    switch (parser.run("ABCDEF")) {
+        .success => |result| {
+            try testing.expectEqualStrings("ABCDEF", result.value());
+        },
+        .err => |_| {
+            try testing.expect(false);
+        },
+    }
+}
+
+test "letters fail" {
+    const parser = letters();
+
+    switch (parser.run("123456")) {
+        .success => |_| {
+            try testing.expect(false);
+        },
+        .err => |e| {
+            try testing.expectEqual(@as(usize, 0), e.index);
+            try testing.expectEqualStrings("letter", e.expected);
+            try testing.expectEqualStrings("123456", e.found);
+        },
+    }
+}
+
 test "sequence with strings" {
     const parser = sequence(&.{ str("hello "), str("world") });
     switch (parser.run("hello world")) {
@@ -163,16 +263,16 @@ test "sequence with strings" {
     }
 }
 
-test "failure sequence with strings" {
-    const parser = sequence(&.{ str("hello "), str("world") });
-    switch (parser.run("hello wold")) {
+test "failure sequence with strings and eof" {
+    const parser = sequence(&.{ str("hello "), str("world"), eof() });
+    switch (parser.run("hello world wow")) {
         .success => |_| {
             try testing.expect(false);
         },
         .err => |e| {
-            try testing.expectEqual(@as(usize, 6), e.index);
-            try testing.expectEqualStrings("world", e.expected);
-            try testing.expectEqualStrings("wold", e.found);
+            try testing.expectEqual(@as(usize, 11), e.index);
+            try testing.expectEqualStrings("end of input", e.expected);
+            try testing.expectEqualStrings(" wow", e.found);
         },
     }
 }
