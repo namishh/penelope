@@ -71,6 +71,7 @@ pub const ParseResult = struct {
 pub const Parser = union(enum) {
     string: []const u8,
     sequence: []const Parser,
+    choice: []const Parser,
     digits,
     letters,
     lettersN: usize,
@@ -163,6 +164,24 @@ pub const Parser = union(enum) {
                     };
                 }
             },
+
+            .choice => |parsers| {
+                const checkpoint = state.index;
+                for (parsers) |parser| {
+                    state.index = checkpoint;
+
+                    if (parser.parse(state)) |_| {
+                        return .{ .start = start, .end = state.index };
+                    } else |err| {
+                        switch (err) {
+                            error.CouldNotMatch => continue,
+                            else => return err,
+                        }
+                    }
+                }
+                state.index = checkpoint;
+                return error.CouldNotMatch;
+            },
         }
 
         return .{ .start = start, .end = state.index };
@@ -192,6 +211,10 @@ pub fn str(value: []const u8) Parser {
 
 pub fn sequence(parsers: []const Parser) Parser {
     return .{ .sequence = parsers };
+}
+
+pub fn choice(parsers: []const Parser) Parser {
+    return .{ .choice = parsers };
 }
 
 pub fn digits() Parser {
@@ -407,6 +430,31 @@ test "digitsN not enough letters" {
         .err => |e| {
             try testing.expectEqual(@as(usize, 3), e.index);
             try testing.expectEqualStrings("digit", e.expected);
+        },
+    }
+}
+
+test "choices" {
+    const parser = choice(&.{ str("hello"), str("world") });
+    switch (parser.run("hello")) {
+        .success => |result| {
+            try testing.expectEqualStrings("hello", result.value());
+        },
+        .err => |_| {
+            try testing.expect(false);
+        },
+    }
+}
+
+test "choices fail" {
+    const parser = choice(&.{ str("hello"), str("world") });
+    switch (parser.run("alpha")) {
+        .success => |_| {
+            try testing.expect(false);
+        },
+        .err => |e| {
+            try testing.expectEqual(@as(usize, 0), e.index);
+            try testing.expectEqualStrings("hello", e.expected);
         },
     }
 }
