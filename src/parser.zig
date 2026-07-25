@@ -72,12 +72,16 @@ pub const Parser = union(enum) {
     string: []const u8,
     sequence: []const Parser,
     choice: []const Parser,
+    lazy: *const fn () Parser,
     many: *const Parser,
     many1: *const Parser,
-    digits,
-    letters,
+    not: *const Parser,
     lettersN: usize,
     digitsN: usize,
+    digits,
+    identifier,
+    any,
+    letters,
     eof,
 
     pub fn parse(self: Parser, state: *ParserState) Error!Span {
@@ -143,6 +147,44 @@ pub const Parser = union(enum) {
                 if (!(state.index >= state.input.len)) {
                     state.record_expected("end of input");
                     return error.CouldNotMatch;
+                }
+            },
+
+            .any => {
+                if (state.index >= state.input.len) {
+                    state.record_expected("any character");
+                    return error.CouldNotMatch;
+                }
+
+                state.index += 1;
+            },
+
+            .identifier => {
+                if (state.index >= state.input.len) {
+                    state.record_expected("identifier");
+                    return error.CouldNotMatch;
+                }
+
+                const first = state.input[state.index];
+
+                if (!(std.ascii.isAlphabetic(first) or first == '_')) {
+                    state.record_expected("identifier");
+                    return error.CouldNotMatch;
+                }
+
+                state.index += 1;
+
+                while (state.index < state.input.len) {
+                    const c = state.input[state.index];
+
+                    if (std.ascii.isAlphabetic(c) or
+                        std.ascii.isDigit(c) or
+                        c == '_')
+                    {
+                        state.index += 1;
+                    } else {
+                        break;
+                    }
                 }
             },
 
@@ -225,6 +267,21 @@ pub const Parser = union(enum) {
                 state.index = checkpoint;
                 return error.CouldNotMatch;
             },
+
+            .not => |parser| {
+                const checkpoint = state.index;
+                if (parser.parse(state)) |_| {
+                    state.index = checkpoint;
+                    return error.CouldNotMatch;
+                } else |_| {
+                    state.index = checkpoint;
+                    return .{ .start = checkpoint, .end = checkpoint };
+                }
+            },
+            .lazy => |f| {
+                const parser = f();
+                return parser.parse(state);
+            },
         }
 
         return .{ .start = start, .end = state.index };
@@ -276,6 +333,18 @@ pub fn digitsN(n: usize) Parser {
     return .{ .digitsN = n };
 }
 
+pub fn not(n: *const Parser) Parser {
+    return .{ .not = n };
+}
+
+pub fn any() Parser {
+    return .any;
+}
+
+pub fn identifier() Parser {
+    return .identifier;
+}
+
 pub fn lettersN(n: usize) Parser {
     return .{ .lettersN = n };
 }
@@ -286,6 +355,10 @@ pub fn many(p: *const Parser) Parser {
 
 pub fn many1(p: *const Parser) Parser {
     return .{ .many1 = p };
+}
+
+pub fn lazy(f: *const fn () Parser) Parser {
+    return .{ .lazy = f };
 }
 
 test "string parser" {
@@ -519,5 +592,32 @@ test "many" {
         .err => |_| {
             try testing.expect(false);
         },
+    }
+}
+
+test "not" {
+    const parser = sequence(&.{ not(&str("XYZ")), letters() });
+    switch (parser.run("ABC")) {
+        .success => |result| {
+            try testing.expectEqualStrings("ABC", result.value());
+        },
+        .err => |_| {
+            try testing.expect(false);
+        },
+    }
+}
+
+fn quotedString() Parser {
+    return sequence(&.{ str("\""), many(&sequence(&.{ not(&str("\"")), any() })), str("\"") });
+}
+
+test "lazy attribute success" {
+    const parser = sequence(&.{ letters(), str("="), lazy(quotedString) });
+
+    switch (parser.run("class=\"container\"")) {
+        .success => |result| {
+            try testing.expectEqualStrings("class=\"container\"", result.value());
+        },
+        .err => |_| try testing.expect(false),
     }
 }
