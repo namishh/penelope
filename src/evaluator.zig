@@ -1005,19 +1005,3 @@ test "comment produces no output" {
     try testing.expectEqualStrings("abc", out);
 }
 
-test "debug float formatting" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeFile(tmp.dir, "t.html", "{{n}}|{{m}}");
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(path);
-    var engine = try Engine.init(testing.allocator, path);
-    defer engine.deinit();
-    var ctx = Context.init(testing.allocator);
-    defer ctx.deinit();
-    try ctx.set("n", .{ .float = 87.0 });
-    try ctx.set("m", .{ .float = 87.654 });
-    const out = try engine.render(testing.allocator, "t.html", &ctx);
-    defer testing.allocator.free(out);
-    std.debug.print("FLOAT_FMT: {s}\n", .{out});
-}
