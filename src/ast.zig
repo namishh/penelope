@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const p = @import("parser.zig");
 
-pub const BinOp = enum { add, sub, mul, div, mod, floordiv, pow, eq, neq, lt, lte, gt, gte, logical_and, logical_or };
+pub const BinOp = enum { add, sub, mul, div, mod, floordiv, pow, concat, eq, neq, lt, lte, gt, gte, logical_and, logical_or };
 pub const UnOp = enum { logical_not, negate };
 
 pub const Accessor = union(enum) {
@@ -38,11 +38,13 @@ pub const Node = union(enum) {
     include: []const u8,
     block: Block,
     macro_def: Macro,
+    set: Set,
 
     pub const If = struct { branches: []const IfBranch, else_body: ?[]const Node };
     pub const For = struct { name: []const u8, iterable: Expr, body: []const Node };
     pub const Block = struct { name: []const u8, body: []const Node };
     pub const Macro = struct { name: []const u8, params: []const []const u8, body: []const Node };
+    pub const Set = struct { name: []const u8, value: Expr };
 };
 
 pub const Template = struct { nodes: []const Node };
@@ -300,8 +302,14 @@ fn parseAdditive(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr
     }, parseMultiplicative);
 }
 
+fn parseConcat(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
+    return parseBinaryLevel(allocator, state, &.{
+        .{ .text = "~", .op = .concat },
+    }, parseAdditive);
+}
+
 fn parseComparison(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
-    const lhs = try parseAdditive(allocator, state);
+    const lhs = try parseConcat(allocator, state);
     skipWs(state);
     const checkpoint = state.index;
     const comparisons = [_]Op{
@@ -315,7 +323,7 @@ fn parseComparison(allocator: std.mem.Allocator, state: *p.ParserState) Error!Ex
     inline for (comparisons) |candidate| {
         if (p.str(candidate.text).parse(state)) |_| {
             skipWs(state);
-            const rhs = try parseAdditive(allocator, state);
+            const rhs = try parseConcat(allocator, state);
             return makeBinary(allocator, candidate.op, lhs, rhs);
         } else |_| {
             state.index = checkpoint;
@@ -427,6 +435,8 @@ fn parseNodes(allocator: std.mem.Allocator, state: *p.ParserState, stop_words: [
                 try nodes.append(allocator, try parseBlock(allocator, state));
             } else if (std.mem.eql(u8, kw, "macro")) {
                 try nodes.append(allocator, try parseMacro(allocator, state));
+            } else if (std.mem.eql(u8, kw, "set")) {
+                try nodes.append(allocator, try parseSet(allocator, state));
             } else {
                 try nodes.append(allocator, try parseOutput(allocator, state));
             }
@@ -518,6 +528,19 @@ fn parseQuotedPath(state: *p.ParserState) Error![]const u8 {
     const span = try string_literal.parse(state);
     const raw = span.slice(state.input);
     return raw[1 .. raw.len - 1];
+}
+
+fn parseSet(allocator: std.mem.Allocator, state: *p.ParserState) Error!Node {
+    if (!keyword(state, "set")) return error.UnexpectedToken;
+    skipWs(state);
+    const name_span = try p.identifier().parse(state);
+    skipWs(state);
+    _ = try p.str("=").parse(state);
+    skipWs(state);
+    const value = try parseExpr(allocator, state);
+    skipWs(state);
+    _ = try close_tag.parse(state);
+    return Node{ .set = .{ .name = name_span.slice(state.input), .value = value } };
 }
 
 fn parseExtends(state: *p.ParserState) Error!Node {
@@ -644,6 +667,30 @@ test "variable: plain, indexed, nested, arithmetic, bool" {
     {
         const t = try parseFixture(a, "{{ true }}");
         try testing.expectEqual(true, t.nodes[0].output.boolean);
+    }
+}
+
+test "string concat with ~ and {{set}}" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        const t = try parseFixture(a, "{{ \"a\" ~ b }}");
+        const bin = t.nodes[0].output.binary;
+        try testing.expectEqual(BinOp.concat, bin.op);
+        try testing.expectEqualStrings("a", bin.lhs.string);
+        try testing.expectEqualStrings("b", bin.rhs.path.name);
+    }
+    {
+        // "~" binds tighter than comparisons: (a ~ b) == c
+        const t = try parseFixture(a, "{{ a ~ b == c }}");
+        try testing.expectEqual(BinOp.eq, t.nodes[0].output.binary.op);
+        try testing.expectEqual(BinOp.concat, t.nodes[0].output.binary.lhs.binary.op);
+    }
+    {
+        const t = try parseFixture(a, "{{set node = child}}");
+        try testing.expectEqualStrings("node", t.nodes[0].set.name);
+        try testing.expectEqualStrings("child", t.nodes[0].set.value.path.name);
     }
 }
 

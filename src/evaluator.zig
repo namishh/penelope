@@ -98,13 +98,14 @@ pub const Engine = struct {
     }
 
     /// Walks a template's `extends` chain from most- to least-derived,
-    /// collecting block overrides and macros along the way (first
-    /// definition seen wins, since we walk child-before-parent), and
-    /// returns the root ancestor's node list to actually render.
+    /// collecting macros (first definition seen wins) and, per block name,
+    /// the ordered chain of bodies from most- to least-derived -- so a
+    /// `super()` call inside the winning body can render the next one up
+    /// -- and returns the root ancestor's node list to actually render.
     fn resolveInheritance(
         self: *Engine,
         name: []const u8,
-        overrides: *std.StringHashMap([]const ast.Node),
+        overrides: *std.StringHashMap(std.ArrayList([]const ast.Node)),
         macros: *std.StringHashMap(ast.Node.Macro),
     ) anyerror!([]const ast.Node) {
         const template = try self.load(name);
@@ -113,7 +114,9 @@ pub const Engine = struct {
         for (template.nodes) |node| {
             switch (node) {
                 .block => |b| {
-                    if (!overrides.contains(b.name)) try overrides.put(b.name, b.body);
+                    const gop = try overrides.getOrPut(b.name);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(self.allocator, b.body);
                 },
                 .macro_def => |m| {
                     if (!macros.contains(m.name)) try macros.put(m.name, m);
@@ -135,8 +138,8 @@ pub const Engine = struct {
     }
 
     fn renderInto(self: *Engine, writer: *std.Io.Writer, name: []const u8, context: *const Context) anyerror!void {
-        var overrides = std.StringHashMap([]const ast.Node).init(self.allocator);
-        defer overrides.deinit();
+        var overrides = std.StringHashMap(std.ArrayList([]const ast.Node)).init(self.allocator);
+        defer freeOverrides(&overrides, self.allocator);
         var macros = std.StringHashMap(ast.Node.Macro).init(self.allocator);
         defer macros.deinit();
 
@@ -154,15 +157,41 @@ pub const Engine = struct {
     }
 };
 
+/// Which override body a `{{ super() }}` call inside it should render next.
+const BlockChain = struct {
+    bodies: []const []const ast.Node, // most-derived first
+    depth: usize,
+};
+
 const Eval = struct {
     engine: *Engine,
     macros: *const std.StringHashMap(ast.Node.Macro),
-    overrides: *const std.StringHashMap([]const ast.Node),
+    overrides: *const std.StringHashMap(std.ArrayList([]const ast.Node)),
     writer: *std.Io.Writer,
     root_scope: *const Scope,
+    block_chain: ?BlockChain = null,
 
     fn evalNodes(self: *Eval, scope: *const Scope, nodes: []const ast.Node) anyerror!void {
-        for (nodes) |node| try self.evalNode(scope, node);
+        // `set` rebinds a name for the rest of this node list (and anything
+        // nested under it), so it's handled here rather than in evalNode --
+        // evalNode only ever sees one node and can't affect its siblings.
+        var current = scope;
+        for (nodes) |node| {
+            if (node == .set) {
+                current = try self.applySet(current, node.set);
+                continue;
+            }
+            try self.evalNode(current, node);
+        }
+    }
+
+    fn applySet(self: *Eval, scope: *const Scope, s: ast.Node.Set) anyerror!*const Scope {
+        const value = try self.evalExpr(scope, s.value);
+        const arena = self.engine.arena.allocator();
+        const bindings = try arena.dupe(Binding, &.{.{ .name = s.name, .value = value }});
+        const new_scope = try arena.create(Scope);
+        new_scope.* = .{ .parent = scope, .bindings = bindings };
+        return new_scope;
     }
 
     fn evalNode(self: *Eval, scope: *const Scope, node: ast.Node) anyerror!void {
@@ -180,17 +209,27 @@ const Eval = struct {
             .for_stmt => |f| try self.evalFor(scope, f),
             .extends => {}, // resolved up-front by Engine.resolveInheritance
             .macro_def => {}, // collected up-front, produces no direct output
+            .set => unreachable, // intercepted by evalNodes before dispatch
             .include => |name| try self.evalInclude(scope, name),
             .block => |b| {
-                const body = self.overrides.get(b.name) orelse b.body;
-                try self.evalNodes(scope, body);
+                if (self.overrides.get(b.name)) |chain| {
+                    try self.renderBlockChain(scope, chain.items, 0);
+                } else {
+                    try self.evalNodes(scope, b.body);
+                }
             },
         }
     }
 
+    fn renderBlockChain(self: *Eval, scope: *const Scope, bodies: []const []const ast.Node, depth: usize) anyerror!void {
+        var sub = self.*;
+        sub.block_chain = .{ .bodies = bodies, .depth = depth };
+        try sub.evalNodes(scope, bodies[depth]);
+    }
+
     fn evalInclude(self: *Eval, scope: *const Scope, name: []const u8) anyerror!void {
-        var overrides = std.StringHashMap([]const ast.Node).init(self.engine.allocator);
-        defer overrides.deinit();
+        var overrides = std.StringHashMap(std.ArrayList([]const ast.Node)).init(self.engine.allocator);
+        defer freeOverrides(&overrides, self.engine.allocator);
         var macros = std.StringHashMap(ast.Node.Macro).init(self.engine.allocator);
         defer macros.deinit();
 
@@ -287,7 +326,15 @@ const Eval = struct {
             .lte => .{ .boolean = try asInt(lhs) <= try asInt(rhs) },
             .gt => .{ .boolean = try asInt(lhs) > try asInt(rhs) },
             .gte => .{ .boolean = try asInt(lhs) >= try asInt(rhs) },
-            .logical_and, .logical_or => unreachable,         };
+            .concat => blk: {
+                const arena = self.engine.arena.allocator();
+                break :blk .{ .string = try std.fmt.allocPrint(arena, "{s}{s}", .{
+                    try stringifyValue(arena, lhs),
+                    try stringifyValue(arena, rhs),
+                }) };
+            },
+            .logical_and, .logical_or => unreachable,
+        };
     }
 
     fn evalUnary(self: *Eval, scope: *const Scope, u: ast.Expr.Unary) anyerror!Value {
@@ -299,6 +346,8 @@ const Eval = struct {
     }
 
     fn evalCall(self: *Eval, scope: *const Scope, call: ast.Expr.Call) anyerror!Value {
+        if (std.mem.eql(u8, call.name, "super")) return self.evalSuper(scope);
+
         const macro = self.macros.get(call.name) orelse return error.UnknownMacro;
 
         const bindings = try self.engine.allocator.alloc(Binding, macro.params.len);
@@ -326,7 +375,27 @@ const Eval = struct {
 
         return .{ .string = try aw.toOwnedSlice() };
     }
+
+    fn evalSuper(self: *Eval, scope: *const Scope) anyerror!Value {
+        const chain = self.block_chain orelse return .{ .string = "" };
+        if (chain.depth + 1 >= chain.bodies.len) return .{ .string = "" };
+
+        var aw = std.Io.Writer.Allocating.init(self.engine.arena.allocator());
+        defer aw.deinit();
+        var sub = self.*;
+        sub.writer = &aw.writer;
+        sub.block_chain = .{ .bodies = chain.bodies, .depth = chain.depth + 1 };
+        try sub.evalNodes(scope, chain.bodies[chain.depth + 1]);
+
+        return .{ .string = try aw.toOwnedSlice() };
+    }
 };
+
+fn freeOverrides(overrides: *std.StringHashMap(std.ArrayList([]const ast.Node)), allocator: std.mem.Allocator) void {
+    var it = overrides.valueIterator();
+    while (it.next()) |chain| chain.deinit(allocator);
+    overrides.deinit();
+}
 
 fn evalPath(scope: *const Scope, path: ast.Expr.Path) Value {
     var current: Value = scope.lookup(path.name);
@@ -343,6 +412,16 @@ fn evalPath(scope: *const Scope, path: ast.Expr.Path) Value {
         };
     }
     return current;
+}
+
+fn stringifyValue(allocator: std.mem.Allocator, v: Value) anyerror![]const u8 {
+    return switch (v) {
+        .null => "",
+        .boolean => |b| if (b) "true" else "false",
+        .string => |s| s,
+        .int => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .array, .object => error.TypeMismatch,
+    };
 }
 
 fn asInt(v: Value) anyerror!i64 {
@@ -422,6 +501,116 @@ test "and, or, not, %, //, **, and unary minus" {
         "ABA-or-Cnot-Cmod=1 floordiv=-4 pow=32 neg_lit=-5 neg_var=-5 neg_expr=-5 double_neg=5",
         out,
     );
+}
+
+test "~ string concat" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "t.html", "{{ \"https://github.com/namishh/\" ~ name ~ \"-\" ~ id }}");
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("name", .{ .string = "penelope" });
+    try ctx.set("id", .{ .int = 7 });
+
+    const out = try engine.render(testing.allocator, "t.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("https://github.com/namishh/penelope-7", out);
+}
+
+test "super() appends to the parent block instead of replacing it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "base.html", "<head>base-head</head>{{block content}}base-content{{end}}");
+    try writeFile(
+        tmp.dir,
+        "child.html",
+        "{{extends \"base.html\"}}" ++
+            "{{block content}}{{ super() }}-and-child{{end}}",
+    );
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+
+    const out = try engine.render(testing.allocator, "child.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("<head>base-head</head>base-content-and-child", out);
+}
+
+test "super() climbs a multi-level extends chain" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "grandparent.html", "{{block x}}G{{end}}");
+    try writeFile(tmp.dir, "parent.html", "{{extends \"grandparent.html\"}}{{block x}}{{ super() }}P{{end}}");
+    try writeFile(tmp.dir, "child.html", "{{extends \"parent.html\"}}{{block x}}{{ super() }}C{{end}}");
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+
+    const out = try engine.render(testing.allocator, "child.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("GPC", out);
+}
+
+test "{{set}} rebinds a name for the rest of a for-loop body, recursively" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Mirrors a recursive file-tree template: `set` rebinds the loop var's
+    // name to what the recursive include expects to find.
+    try writeFile(
+        tmp.dir,
+        "tree.html",
+        "{{node.name}}(" ++
+            "{{for child in node.children}}{{set node = child}}{{include \"tree.html\"}}{{end}}" ++
+            ")",
+    );
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var grandchild = std.StringHashMap(Value).init(testing.allocator);
+    defer grandchild.deinit();
+    try grandchild.put("name", .{ .string = "c" });
+    try grandchild.put("children", .{ .array = &.{} });
+
+    var children = [_]Value{.{ .object = grandchild }};
+
+    var child = std.StringHashMap(Value).init(testing.allocator);
+    defer child.deinit();
+    try child.put("name", .{ .string = "b" });
+    try child.put("children", .{ .array = &children });
+
+    var roots = [_]Value{.{ .object = child }};
+
+    var root = std.StringHashMap(Value).init(testing.allocator);
+    defer root.deinit();
+    try root.put("name", .{ .string = "a" });
+    try root.put("children", .{ .array = &roots });
+
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("node", .{ .object = root });
+
+    const out = try engine.render(testing.allocator, "tree.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a(b(c()))", out);
 }
 
 test "if / elseif / else" {
