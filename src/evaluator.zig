@@ -6,6 +6,7 @@ pub const Value = union(enum) {
     null,
     boolean: bool,
     int: i64,
+    float: f64,
     string: []const u8,
     array: []const Value,
     object: std.StringHashMap(Value),
@@ -15,19 +16,55 @@ pub const Value = union(enum) {
             .null => false,
             .boolean => |b| b,
             .int => |i| i != 0,
+            .float => |f| f != 0.0,
             .string => |s| s.len != 0,
             .array => |a| a.len != 0,
             .object => |o| o.count() != 0,
         };
     }
 
+    fn isNumeric(self: Value) bool {
+        return self == .int or self == .float;
+    }
+
     fn eql(a: Value, b: Value) bool {
+        if (a.isNumeric() and b.isNumeric()) return (a.toF64() catch unreachable) == (b.toF64() catch unreachable);
         return switch (a) {
             .null => b == .null,
             .boolean => |x| b == .boolean and b.boolean == x,
-            .int => |x| b == .int and b.int == x,
             .string => |x| b == .string and std.mem.eql(u8, b.string, x),
+            .int, .float => unreachable, 
             .array, .object => false,
+        };
+    }
+
+    fn toF64(self: Value) anyerror!f64 {
+        return switch (self) {
+            .int => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => error.TypeMismatch,
+        };
+    }
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) anyerror!Value {
+        return switch (json) {
+            .null => .null,
+            .bool => |b| .{ .boolean = b },
+            .integer => |i| .{ .int = i },
+            .float => |f| .{ .float = f },
+            .number_string => |s| .{ .float = std.fmt.parseFloat(f64, s) catch return error.TypeMismatch },
+            .string => |s| .{ .string = s },
+            .array => |arr| blk: {
+                const items = try allocator.alloc(Value, arr.items.len);
+                for (arr.items, 0..) |item, i| items[i] = try fromJson(allocator, item);
+                break :blk .{ .array = items };
+            },
+            .object => |obj| blk: {
+                var map = std.StringHashMap(Value).init(allocator);
+                var it = obj.iterator();
+                while (it.next()) |entry| try map.put(entry.key_ptr.*, try fromJson(allocator, entry.value_ptr.*));
+                break :blk .{ .object = map };
+            },
         };
     }
 };
@@ -277,6 +314,7 @@ const Eval = struct {
             .null => {},
             .boolean => |b| try self.writer.writeAll(if (b) "true" else "false"),
             .int => |i| try self.writer.print("{d}", .{i}),
+            .float => |f| try self.writer.print("{d}", .{f}),
             .string => |s| try self.writer.writeAll(s),
             .array, .object => return error.TypeMismatch,
         }
@@ -285,6 +323,7 @@ const Eval = struct {
     fn evalExpr(self: *Eval, scope: *const Scope, expr: ast.Expr) anyerror!Value {
         return switch (expr) {
             .int => |v| .{ .int = v },
+            .float => |v| .{ .float = v },
             .boolean => |v| .{ .boolean = v },
             .string => |v| .{ .string = v },
             .path => |path| evalPath(scope, path),
@@ -314,19 +353,13 @@ const Eval = struct {
         const lhs = try self.evalExpr(scope, b.lhs.*);
         const rhs = try self.evalExpr(scope, b.rhs.*);
         return switch (b.op) {
-            .add => .{ .int = try asInt(lhs) + try asInt(rhs) },
-            .sub => .{ .int = try asInt(lhs) - try asInt(rhs) },
-            .mul => .{ .int = try asInt(lhs) * try asInt(rhs) },
-            .div => .{ .int = @divTrunc(try asInt(lhs), try asInt(rhs)) },
-            .floordiv => .{ .int = @divFloor(try asInt(lhs), try asInt(rhs)) },
-            .mod => .{ .int = @mod(try asInt(lhs), try asInt(rhs)) },
-            .pow => .{ .int = try intPow(try asInt(lhs), try asInt(rhs)) },
+            .add, .sub, .mul, .div, .floordiv, .mod, .pow => try numericBinOp(b.op, lhs, rhs),
             .eq => .{ .boolean = lhs.eql(rhs) },
             .neq => .{ .boolean = !lhs.eql(rhs) },
-            .lt => .{ .boolean = try asInt(lhs) < try asInt(rhs) },
-            .lte => .{ .boolean = try asInt(lhs) <= try asInt(rhs) },
-            .gt => .{ .boolean = try asInt(lhs) > try asInt(rhs) },
-            .gte => .{ .boolean = try asInt(lhs) >= try asInt(rhs) },
+            .lt => .{ .boolean = (try numericCompare(lhs, rhs)) == .lt },
+            .lte => .{ .boolean = (try numericCompare(lhs, rhs)) != .gt },
+            .gt => .{ .boolean = (try numericCompare(lhs, rhs)) == .gt },
+            .gte => .{ .boolean = (try numericCompare(lhs, rhs)) != .lt },
             .concat => blk: {
                 const arena = self.engine.arena.allocator();
                 break :blk .{ .string = try std.fmt.allocPrint(arena, "{s}{s}", .{
@@ -342,7 +375,11 @@ const Eval = struct {
         const operand = try self.evalExpr(scope, u.operand.*);
         return switch (u.op) {
             .logical_not => .{ .boolean = !operand.truthy() },
-            .negate => .{ .int = -(try asInt(operand)) },
+            .negate => switch (operand) {
+                .int => |i| .{ .int = -i },
+                .float => |f| .{ .float = -f },
+                else => error.TypeMismatch,
+            },
         };
     }
 
@@ -402,9 +439,30 @@ const Eval = struct {
                 if (input != .null) break :blk input;
                 break :blk if (f.args.len > 0) try self.evalExpr(scope, f.args[0]) else .null;
             },
-            // Values are always integers -- these are exact already. No-ops
-            // until a float Value variant exists to round/truncate.
-            .round, .trunc, .ceil, .floor => .{ .int = try asInt(input) },
+            .trunc => switch (input) {
+                .int => input,
+                .float => |v| .{ .float = @trunc(v) },
+                else => error.TypeMismatch,
+            },
+            .ceil => switch (input) {
+                .int => input,
+                .float => |v| .{ .float = @ceil(v) },
+                else => error.TypeMismatch,
+            },
+            .floor => switch (input) {
+                .int => input,
+                .float => |v| .{ .float = @floor(v) },
+                else => error.TypeMismatch,
+            },
+            .round => switch (input) {
+                .int => input,
+                .float => |v| blk: {
+                    const precision = if (f.args.len > 0) try asInt(try self.evalExpr(scope, f.args[0])) else 0;
+                    const scale = std.math.pow(f64, 10, @as(f64, @floatFromInt(precision)));
+                    break :blk .{ .float = @round(v * scale) / scale };
+                },
+                else => error.TypeMismatch,
+            },
             .upper => .{ .string = try mapAscii(arena, try stringifyValue(arena, input), std.ascii.toUpper) },
             .lower => .{ .string = try mapAscii(arena, try stringifyValue(arena, input), std.ascii.toLower) },
             .title => .{ .string = try titleCase(arena, try stringifyValue(arena, input)) },
@@ -486,6 +544,7 @@ fn stringifyValue(allocator: std.mem.Allocator, v: Value) anyerror![]const u8 {
         .boolean => |b| if (b) "true" else "false",
         .string => |s| s,
         .int => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
         .array, .object => error.TypeMismatch,
     };
 }
@@ -503,6 +562,44 @@ fn intPow(base: i64, exp: i64) anyerror!i64 {
     var i: i64 = 0;
     while (i < exp) : (i += 1) result *= base;
     return result;
+}
+
+// int-int arithmetic stays exact (unchanged from before floats existed);
+// once either side is a float, both promote to f64 and use real float math
+// -- which also gives "/" real division once floats are involved, same as
+// most dynamic languages, while "//" stays floor division either way.
+fn numericBinOp(op: ast.BinOp, lhs: Value, rhs: Value) anyerror!Value {
+    if (lhs == .int and rhs == .int) {
+        const a = lhs.int;
+        const c = rhs.int;
+        return switch (op) {
+            .add => .{ .int = a + c },
+            .sub => .{ .int = a - c },
+            .mul => .{ .int = a * c },
+            .div => .{ .int = @divTrunc(a, c) },
+            .floordiv => .{ .int = @divFloor(a, c) },
+            .mod => .{ .int = @mod(a, c) },
+            .pow => .{ .int = try intPow(a, c) },
+            else => unreachable,
+        };
+    }
+    const a = try lhs.toF64();
+    const c = try rhs.toF64();
+    return switch (op) {
+        .add => .{ .float = a + c },
+        .sub => .{ .float = a - c },
+        .mul => .{ .float = a * c },
+        .div => .{ .float = a / c },
+        .floordiv => .{ .float = @divFloor(a, c) },
+        .mod => .{ .float = @mod(a, c) },
+        .pow => .{ .float = std.math.pow(f64, a, c) },
+        else => unreachable,
+    };
+}
+
+fn numericCompare(lhs: Value, rhs: Value) anyerror!std.math.Order {
+    if (lhs == .int and rhs == .int) return std.math.order(lhs.int, rhs.int);
+    return std.math.order(try lhs.toF64(), try rhs.toF64());
 }
 
 fn writeFile(dir: std.fs.Dir, name: []const u8, contents: []const u8) !void {
@@ -567,6 +664,90 @@ test "and, or, not, %, //, **, and unary minus" {
         "ABA-or-Cnot-Cmod=1 floordiv=-4 pow=32 neg_lit=-5 neg_var=-5 neg_expr=-5 double_neg=5",
         out,
     );
+}
+
+test "float arithmetic: int/float promotion, comparisons, negate" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(
+        tmp.dir,
+        "t.html",
+        "sum={{price + tax}} " ++
+            "div={{7 / 2}} fdiv={{7.0 / 2}} " ++
+            "cmp={{if price > 9.5}}yes{{else}}no{{end}} " ++
+            "eq={{if whole == 5}}eq5{{end}} " ++
+            "neg={{-price}}",
+    );
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("price", .{ .float = 9.99 });
+    try ctx.set("tax", .{ .int = 1 });
+    try ctx.set("whole", .{ .float = 5.0 });
+
+    const out = try engine.render(testing.allocator, "t.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "sum=10.99 div=3 fdiv=3.5 cmp=yes eq=eq5 neg=-9.99",
+        out,
+    );
+}
+
+test "round/trunc/ceil/floor on floats" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(
+        tmp.dir,
+        "t.html",
+        "round={{n | round(1)}} trunc={{n | trunc}} ceil={{n | ceil}} floor={{n | floor}}",
+    );
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("n", .{ .float = 7.86 });
+
+    const out = try engine.render(testing.allocator, "t.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("round=7.9 trunc=7 ceil=8 floor=7", out);
+}
+
+test "Value.fromJson brings arbitrary JSON into a Context" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "t.html", "{{data.name}} scored {{data.score | round(1)}}, tags={{for tag in data.tags}}[{{tag}}]{{end}}");
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"name\": \"Ada\", \"score\": 87.654, \"tags\": [\"a\", \"b\"]}",
+        .{},
+    );
+    const data = try Value.fromJson(arena.allocator(), parsed);
+
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("data", data);
+
+    const out = try engine.render(testing.allocator, "t.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("Ada scored 87.7, tags=[a][b]", out);
 }
 
 test "filters: length, safe, default, round/trunc/ceil/floor, upper/lower/title, escape" {
@@ -822,4 +1003,21 @@ test "comment produces no output" {
     const out = try engine.render(testing.allocator, "t.html", &ctx);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("abc", out);
+}
+
+test "debug float formatting" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "t.html", "{{n}}|{{m}}");
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("n", .{ .float = 87.0 });
+    try ctx.set("m", .{ .float = 87.654 });
+    const out = try engine.render(testing.allocator, "t.html", &ctx);
+    defer testing.allocator.free(out);
+    std.debug.print("FLOAT_FMT: {s}\n", .{out});
 }

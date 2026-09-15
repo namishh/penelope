@@ -12,6 +12,7 @@ pub const Accessor = union(enum) {
 
 pub const Expr = union(enum) {
     int: i64,
+    float: f64,
     boolean: bool,
     string: []const u8,
     path: Path,
@@ -124,10 +125,25 @@ fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-fn parseInt(state: *p.ParserState) Error!i64 {
-    const span = try p.digits().parse(state);
-    const value = std.fmt.parseInt(i64, span.slice(state.input), 10) catch return error.UnexpectedToken;
-    return value;
+// digits, optionally followed by ".digits" for a float literal. "3." with
+// no fractional digits backs up and is parsed as just the int "3".
+fn parseNumber(state: *p.ParserState) Error!Expr {
+    const start = state.index;
+    const int_span = try p.digits().parse(state);
+
+    const before_dot = state.index;
+    if (p.str(".").parse(state)) |_| {
+        if (p.digits().parse(state)) |_| {
+            const text = state.input[start..state.index];
+            const value = std.fmt.parseFloat(f64, text) catch return error.UnexpectedToken;
+            return Expr{ .float = value };
+        } else |_| {
+            state.index = before_dot;
+        }
+    } else |_| {}
+
+    const value = std.fmt.parseInt(i64, int_span.slice(state.input), 10) catch return error.UnexpectedToken;
+    return Expr{ .int = value };
 }
 
 fn parsePrimary(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
@@ -157,8 +173,8 @@ fn parsePrimary(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr 
         state.index = checkpoint;
     }
 
-    if (parseInt(state)) |value| {
-        return Expr{ .int = value };
+    if (parseNumber(state)) |expr| {
+        return expr;
     } else |_| {
         state.index = checkpoint;
     }
@@ -704,6 +720,27 @@ test "variable: plain, indexed, nested, arithmetic, bool" {
     {
         const t = try parseFixture(a, "{{ true }}");
         try testing.expectEqual(true, t.nodes[0].output.boolean);
+    }
+}
+
+test "float literals" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        const t = try parseFixture(a, "{{ 3.14 }}");
+        try testing.expectEqual(@as(f64, 3.14), t.nodes[0].output.float);
+    }
+    {
+        const t = try parseFixture(a, "{{ -2.5 }}");
+        try testing.expectEqual(@as(f64, 2.5), t.nodes[0].output.unary.operand.float);
+    }
+    {
+        // A range like "1..5" must still parse as int(1) .. int(5), not
+        // choke trying to read "." + "." as a fractional part.
+        const t = try parseFixture(a, "{{for i in 1..5}}{{end}}");
+        try testing.expectEqual(@as(i64, 1), t.nodes[0].for_stmt.iterable.range.start.int);
+        try testing.expectEqual(@as(i64, 5), t.nodes[0].for_stmt.iterable.range.end.int);
     }
 }
 
