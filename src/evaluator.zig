@@ -291,7 +291,8 @@ const Eval = struct {
             .binary => |b| try self.evalBinary(scope, b),
             .unary => |u| try self.evalUnary(scope, u),
             .call => |c| try self.evalCall(scope, c),
-            .range => error.TypeMismatch, 
+            .filter => |f| try self.evalFilter(scope, f),
+            .range => error.TypeMismatch,
         };
     }
 
@@ -389,7 +390,72 @@ const Eval = struct {
 
         return .{ .string = try aw.toOwnedSlice() };
     }
+
+    fn evalFilter(self: *Eval, scope: *const Scope, f: ast.Expr.Filter) anyerror!Value {
+        const input = try self.evalExpr(scope, f.input.*);
+        const name = std.meta.stringToEnum(FilterName, f.name) orelse return error.UnknownFilter;
+        const arena = self.engine.arena.allocator();
+        return switch (name) {
+            .length => .{ .int = try filterLength(input) },
+            .safe => input, // nothing auto-escapes by default, so there's nothing to opt out of yet
+            .default => blk: {
+                if (input != .null) break :blk input;
+                break :blk if (f.args.len > 0) try self.evalExpr(scope, f.args[0]) else .null;
+            },
+            // Values are always integers -- these are exact already. No-ops
+            // until a float Value variant exists to round/truncate.
+            .round, .trunc, .ceil, .floor => .{ .int = try asInt(input) },
+            .upper => .{ .string = try mapAscii(arena, try stringifyValue(arena, input), std.ascii.toUpper) },
+            .lower => .{ .string = try mapAscii(arena, try stringifyValue(arena, input), std.ascii.toLower) },
+            .title => .{ .string = try titleCase(arena, try stringifyValue(arena, input)) },
+            .escape => .{ .string = try htmlEscape(arena, try stringifyValue(arena, input)) },
+        };
+    }
 };
+
+const FilterName = enum { length, safe, default, round, trunc, ceil, floor, upper, lower, title, escape };
+
+fn filterLength(v: Value) anyerror!i64 {
+    return switch (v) {
+        .string => |s| @intCast(s.len),
+        .array => |a| @intCast(a.len),
+        .object => |o| @intCast(o.count()),
+        else => error.TypeMismatch,
+    };
+}
+
+fn mapAscii(allocator: std.mem.Allocator, s: []const u8, comptime f: fn (u8) u8) ![]const u8 {
+    const buf = try allocator.alloc(u8, s.len);
+    for (s, 0..) |c, i| buf[i] = f(c);
+    return buf;
+}
+
+fn titleCase(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const buf = try allocator.alloc(u8, s.len);
+    var start_of_word = true;
+    for (s, 0..) |c, i| {
+        buf[i] = if (start_of_word) std.ascii.toUpper(c) else std.ascii.toLower(c);
+        start_of_word = std.ascii.isWhitespace(c);
+    }
+    return buf;
+}
+
+fn htmlEscape(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    for (s) |c| {
+        const entity: ?[]const u8 = switch (c) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            else => null,
+        };
+        if (entity) |e| try aw.writer.writeAll(e) else try aw.writer.writeByte(c);
+    }
+    return try aw.toOwnedSlice();
+}
 
 fn freeOverrides(overrides: *std.StringHashMap(std.ArrayList([]const ast.Node)), allocator: std.mem.Allocator) void {
     var it = overrides.valueIterator();
@@ -499,6 +565,46 @@ test "and, or, not, %, //, **, and unary minus" {
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(
         "ABA-or-Cnot-Cmod=1 floordiv=-4 pow=32 neg_lit=-5 neg_var=-5 neg_expr=-5 double_neg=5",
+        out,
+    );
+}
+
+test "filters: length, safe, default, round/trunc/ceil/floor, upper/lower/title, escape" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(
+        tmp.dir,
+        "t.html",
+        "len={{items | length}} " ++
+            "safe={{raw | safe}} " ++
+            "def1={{missing | default(\"fallback\")}} def2={{name | default(\"fallback\")}} " ++
+            "round={{n | round(2)}} trunc={{n | trunc}} ceil={{n | ceil()}} floor={{n | floor}} " ++
+            "upper={{name | upper}} lower={{name | lower}} title={{phrase | title}} " ++
+            "escape={{html | escape}}",
+    );
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var items = [_]Value{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } };
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("items", .{ .array = &items });
+    try ctx.set("raw", .{ .string = "<b>hi</b>" });
+    try ctx.set("name", .{ .string = "Ada" });
+    try ctx.set("n", .{ .int = 7 });
+    try ctx.set("phrase", .{ .string = "hello world" });
+    try ctx.set("html", .{ .string = "<a href=\"x\">&'\"</a>" });
+
+    const out = try engine.render(testing.allocator, "t.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "len=3 safe=<b>hi</b> def1=fallback def2=Ada " ++
+            "round=7 trunc=7 ceil=7 floor=7 " ++
+            "upper=ADA lower=ada title=Hello World " ++
+            "escape=&lt;a href=&quot;x&quot;&gt;&amp;&#39;&quot;&lt;/a&gt;",
         out,
     );
 }

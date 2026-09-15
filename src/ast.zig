@@ -18,12 +18,14 @@ pub const Expr = union(enum) {
     binary: Binary,
     unary: Unary,
     call: Call,
+    filter: Filter,
     range: Range,
 
     pub const Path = struct { name: []const u8, accessors: []const Accessor };
     pub const Binary = struct { op: BinOp, lhs: *const Expr, rhs: *const Expr };
     pub const Unary = struct { op: UnOp, operand: *const Expr };
     pub const Call = struct { name: []const u8, args: []const Expr };
+    pub const Filter = struct { name: []const u8, input: *const Expr, args: []const Expr };
     pub const Range = struct { start: *const Expr, end: *const Expr };
 };
 
@@ -171,31 +173,36 @@ fn parsePrimary(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr 
     return error.UnexpectedToken;
 }
 
+// Consumes up to and including the closing ")"; the opening "(" must
+// already be consumed by the caller. Shared by call-args and filter-args.
+fn parseArgList(allocator: std.mem.Allocator, state: *p.ParserState) Error![]const Expr {
+    var args: std.ArrayList(Expr) = .empty;
+    skipWs(state);
+    const before_args = state.index;
+    if (p.str(")").parse(state)) |_| {
+        return try args.toOwnedSlice(allocator);
+    } else |_| {
+        state.index = before_args;
+    }
+    while (true) {
+        try args.append(allocator, try parseExpr(allocator, state));
+        skipWs(state);
+        if (p.str(",").parse(state)) |_| {
+            skipWs(state);
+            continue;
+        } else |_| {}
+        break;
+    }
+    skipWs(state);
+    _ = try p.str(")").parse(state);
+    return try args.toOwnedSlice(allocator);
+}
+
 fn parsePathOrCall(allocator: std.mem.Allocator, state: *p.ParserState, name: []const u8) Error!Expr {
     skipWs(state);
 
     if (p.str("(").parse(state)) |_| {
-        var args: std.ArrayList(Expr) = .empty;
-        skipWs(state);
-        const before_args = state.index;
-        if (p.str(")").parse(state)) |_| {
-            // no arguments
-        } else |_| {
-            state.index = before_args;
-            while (true) {
-                const arg = try parseExpr(allocator, state);
-                try args.append(allocator, arg);
-                skipWs(state);
-                if (p.str(",").parse(state)) |_| {
-                    skipWs(state);
-                    continue;
-                } else |_| {}
-                break;
-            }
-            skipWs(state);
-            _ = try p.str(")").parse(state);
-        }
-        return Expr{ .call = .{ .name = name, .args = try args.toOwnedSlice(allocator) } };
+        return Expr{ .call = .{ .name = name, .args = try parseArgList(allocator, state) } };
     } else |_| {}
 
     var accessors: std.ArrayList(Accessor) = .empty;
@@ -262,6 +269,36 @@ fn parseBinaryLevel(
     return lhs;
 }
 
+// Filters bind directly to the primary before them ("|" is effectively a
+// postfix, like ".field" or "[index]"), so `media | length == 0` reads as
+// `(media | length) == 0` -- filters must resolve before any operator above
+// this level ever gets a chance to run.
+fn parseFilters(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
+    var expr = try parsePrimary(allocator, state);
+    while (true) {
+        skipWs(state);
+        const checkpoint = state.index;
+        if (p.str("|").parse(state)) |_| {
+            skipWs(state);
+            const name_span = try p.identifier().parse(state);
+            skipWs(state);
+
+            var args: []const Expr = &.{};
+            if (p.str("(").parse(state)) |_| {
+                args = try parseArgList(allocator, state);
+            } else |_| {}
+
+            const input_ptr = try allocator.create(Expr);
+            input_ptr.* = expr;
+            expr = Expr{ .filter = .{ .name = name_span.slice(state.input), .input = input_ptr, .args = args } };
+        } else |_| {
+            state.index = checkpoint;
+            break;
+        }
+    }
+    return expr;
+}
+
 // Applies to any primary, not just int literals: -x, -(a + b), -foo().
 fn parseUnaryMinus(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
     skipWs(state);
@@ -275,7 +312,7 @@ fn parseUnaryMinus(allocator: std.mem.Allocator, state: *p.ParserState) Error!Ex
     } else |_| {
         state.index = checkpoint;
     }
-    return parsePrimary(allocator, state);
+    return parseFilters(allocator, state);
 }
 
 fn parsePower(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
@@ -667,6 +704,40 @@ test "variable: plain, indexed, nested, arithmetic, bool" {
     {
         const t = try parseFixture(a, "{{ true }}");
         try testing.expectEqual(true, t.nodes[0].output.boolean);
+    }
+}
+
+test "filters: bare, with args, chained, and binding tighter than ==" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        const t = try parseFixture(a, "{{ name | upper }}");
+        const f = t.nodes[0].output.filter;
+        try testing.expectEqualStrings("upper", f.name);
+        try testing.expectEqualStrings("name", f.input.path.name);
+        try testing.expectEqual(@as(usize, 0), f.args.len);
+    }
+    {
+        const t = try parseFixture(a, "{{ query | default(\"\") }}");
+        const f = t.nodes[0].output.filter;
+        try testing.expectEqualStrings("default", f.name);
+        try testing.expectEqual(@as(usize, 1), f.args.len);
+        try testing.expectEqualStrings("", f.args[0].string);
+    }
+    {
+        // chained: (name | lower) | title
+        const t = try parseFixture(a, "{{ name | lower | title }}");
+        const outer = t.nodes[0].output.filter;
+        try testing.expectEqualStrings("title", outer.name);
+        try testing.expectEqualStrings("lower", outer.input.filter.name);
+    }
+    {
+        // filters bind tighter than comparisons: (media | length) == 0
+        const t = try parseFixture(a, "{{ media | length == 0 }}");
+        const bin = t.nodes[0].output.binary;
+        try testing.expectEqual(BinOp.eq, bin.op);
+        try testing.expectEqualStrings("length", bin.lhs.filter.name);
     }
 }
 
