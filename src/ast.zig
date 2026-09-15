@@ -87,8 +87,6 @@ fn containsStr(list: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Tries to consume a keyword identifier (e.g. "if", "end"). Consumes and
-/// returns true on match; leaves state untouched and returns false otherwise.
 fn keyword(state: *p.ParserState, word: []const u8) bool {
     const checkpoint = state.index;
     const span = p.identifier().parse(state) catch {
