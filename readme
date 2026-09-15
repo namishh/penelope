@@ -1,0 +1,65 @@
+penelope: small templating engine for zig.
+
+## install:
+
+$ zig fetch --save https://github.com/namishh/penelope/archive/<commit>.tar.gz
+
+
+in your build.zig:
+
+const penelope_dep = b.dependency("penelope", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("penelope", penelope_dep.module("penelope"));
+
+## help:
+var engine = try penelope.new(allocator, "templates");
+defer engine.deinit();
+
+var ctx = penelope.Context.init(alloc);
+defer ctx.deinit();
+
+try ctx.set("name", .{.string = "World"});
+const html = try penelop.render(allocator, "templates/hello.html", &ctx);
+
+defer alloc.free(html)
+
+## template syntax:
+
+1. variable/expr: {{name}} {{items[0]}
+2. if:
+
+{{if a > b}}
+A 
+{{else}}
+B 
+{{end}}
+
+3. for:
+
+{{for item in items}}
+  {{item}}
+{{end}}
+
+{{for item in 1.100}}
+  {{item}}
+{{end}}
+
+4. base and extends requies engine:
+{# base.html #}
+<body>
+  {{block content}}
+    Default content
+  {{end}}
+</body>
+
+{# page.html #}
+{{extends "base.html"}}
+{{block content}}
+  Hello, {{name}}!
+{{end}}
+
+5. include: {{include "partials/footer.html"}}
+6. macros:
+
+{{macro button(text, url)}}<a href="{{url}}">{{text}}</a>{{end}}
+
+{{ button("Click", "/go") }}
