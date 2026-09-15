@@ -23,7 +23,7 @@ pub const ParseError = struct {
     }
 };
 
-const ParserState = struct {
+pub const ParserState = struct {
     input: []const u8,
     index: usize = 0,
     error_info: ?ParseError = null,
@@ -82,6 +82,7 @@ pub const Parser = union(enum) {
     identifier,
     any,
     letters,
+    space,
     eof,
 
     pub fn parse(self: Parser, state: *ParserState) Error!Span {
@@ -109,9 +110,17 @@ pub const Parser = union(enum) {
                 }
             },
 
+            .space => {
+                if (state.index >= state.input.len or !std.ascii.isWhitespace(state.input[state.index])) {
+                    state.record_expected("whitespace");
+                    return error.CouldNotMatch;
+                }
+                state.index += 1;
+            },
+
             .lettersN => |size| {
                 if (size > state.input.len - start) {
-                    state.record_expected(std.fmt.allocPrint(std.heap.page_allocator, "{d} letters", .{size}) catch "letters");
+                    state.record_expected("letters");
                     return error.CouldNotMatch;
                 }
 
@@ -128,7 +137,7 @@ pub const Parser = union(enum) {
 
             .digitsN => |size| {
                 if (size > state.input.len - start) {
-                    state.record_expected(std.fmt.allocPrint(std.heap.page_allocator, "{d} digits", .{size}) catch "digits");
+                    state.record_expected("digits");
                     return error.CouldNotMatch;
                 }
 
@@ -209,45 +218,11 @@ pub const Parser = union(enum) {
                 }
             },
 
-            .many => |parser| {
-                while (true) {
-                    const checkpoint = state.index;
-                    _ = parser.parse(state) catch |err| {
-                        switch (err) {
-                            error.CouldNotMatch => {
-                                state.index = checkpoint;
-                                break;
-                            },
-
-                            else => return err,
-                        }
-                    };
-
-                    if (state.index == checkpoint) {
-                        return error.ParserDidNotConsumeInput;
-                    }
-                }
-            },
+            .many => |parser| try matchMany(parser, state),
 
             .many1 => |parser| {
                 _ = try parser.parse(state);
-                while (true) {
-                    const checkpoint = state.index;
-                    _ = parser.parse(state) catch |err| {
-                        switch (err) {
-                            error.CouldNotMatch => {
-                                state.index = checkpoint;
-                                break;
-                            },
-
-                            else => return err,
-                        }
-                    };
-
-                    if (state.index == checkpoint) {
-                        return error.ParserDidNotConsumeInput;
-                    }
-                }
+                try matchMany(parser, state);
             },
 
             .choice => |parsers| {
@@ -305,6 +280,27 @@ pub const Parser = union(enum) {
     }
 };
 
+// Shared by `many` (zero or more) and `many1` (one or more, after its
+// mandatory first match) so the repeat/backtrack loop exists once.
+fn matchMany(parser: *const Parser, state: *ParserState) Error!void {
+    while (true) {
+        const checkpoint = state.index;
+        _ = parser.parse(state) catch |err| {
+            switch (err) {
+                error.CouldNotMatch => {
+                    state.index = checkpoint;
+                    return;
+                },
+                else => return err,
+            }
+        };
+
+        if (state.index == checkpoint) {
+            return error.ParserDidNotConsumeInput;
+        }
+    }
+}
+
 pub fn str(value: []const u8) Parser {
     return .{ .string = value };
 }
@@ -323,6 +319,10 @@ pub fn digits() Parser {
 
 pub fn letters() Parser {
     return .letters;
+}
+
+pub fn space() Parser {
+    return .space;
 }
 
 pub fn eof() Parser {
@@ -361,123 +361,54 @@ pub fn lazy(f: *const fn () Parser) Parser {
     return .{ .lazy = f };
 }
 
-test "string parser" {
-    const parser = str("hello");
+fn expectOk(parser: Parser, input: []const u8, expected: []const u8) !void {
+    switch (parser.run(input)) {
+        .success => |result| try testing.expectEqualStrings(expected, result.value()),
+        .err => try testing.expect(false),
+    }
+}
 
-    switch (parser.run("hello")) {
-        .success => |result| {
-            try testing.expectEqualStrings("hello", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
+fn expectErr(parser: Parser, input: []const u8, index: usize, expected: []const u8, found: []const u8) !void {
+    switch (parser.run(input)) {
+        .success => try testing.expect(false),
+        .err => |e| {
+            try testing.expectEqual(index, e.index);
+            try testing.expectEqualStrings(expected, e.expected);
+            try testing.expectEqualStrings(found, e.found);
         },
     }
+}
+
+test "string parser" {
+    try expectOk(str("hello"), "hello", "hello");
 }
 
 test "string parser failure" {
-    const parser = str("hello");
-    switch (parser.run("helo")) {
-        .success => |_| try testing.expect(false),
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 0), e.index);
-            try testing.expectEqualStrings("hello", e.expected);
-            try testing.expectEqualStrings("helo", e.found);
-        },
-    }
+    try expectErr(str("hello"), "helo", 0, "hello", "helo");
 }
 
-test "digits pass" {
-    const parser = digits();
-
-    switch (parser.run("1234")) {
-        .success => |result| {
-            try testing.expectEqualStrings("1234", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
-        },
-    }
+test "digits" {
+    try expectOk(digits(), "12345654321", "12345654321");
 }
 
 test "digits fail" {
-    const parser = digits();
-
-    switch (parser.run("a1234")) {
-        .success => |_| {
-            try testing.expect(false);
-        },
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 0), e.index);
-            try testing.expectEqualStrings("digit", e.expected);
-            try testing.expectEqualStrings("a1234", e.found);
-        },
-    }
-}
-
-test "letters pass" {
-    const parser = letters();
-
-    switch (parser.run("ABCDEF")) {
-        .success => |result| {
-            try testing.expectEqualStrings("ABCDEF", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
-        },
-    }
-}
-
-test "letters fail" {
-    const parser = letters();
-
-    switch (parser.run("123456")) {
-        .success => |_| {
-            try testing.expect(false);
-        },
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 0), e.index);
-            try testing.expectEqualStrings("letter", e.expected);
-            try testing.expectEqualStrings("123456", e.found);
-        },
-    }
-}
-
-test "sequence with strings" {
-    const parser = sequence(&.{ str("hello "), str("world") });
-    switch (parser.run("hello world")) {
-        .success => |result| {
-            try testing.expectEqualStrings("hello world", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
-        },
-    }
-}
-
-test "failure sequence with strings and eof" {
-    const parser = sequence(&.{ str("hello "), str("world"), eof() });
-    switch (parser.run("hello world wow")) {
-        .success => |_| {
-            try testing.expect(false);
-        },
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 11), e.index);
-            try testing.expectEqualStrings("end of input", e.expected);
-            try testing.expectEqualStrings(" wow", e.found);
-        },
-    }
+    try expectErr(digits(), "a1234", 0, "digit", "a1234");
 }
 
 test "letters" {
-    const parser = letters();
-    switch (parser.run("helloworld")) {
-        .success => |result| {
-            try testing.expectEqualStrings("helloworld", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
-        },
-    }
+    try expectOk(letters(), "helloworld", "helloworld");
+}
+
+test "letters fail" {
+    try expectErr(letters(), "123456", 0, "letter", "123456");
+}
+
+test "sequence with strings" {
+    try expectOk(sequence(&.{ str("hello "), str("world") }), "hello world", "hello world");
+}
+
+test "failure sequence with strings and eof" {
+    try expectErr(sequence(&.{ str("hello "), str("world"), eof() }), "hello world wow", 11, "end of input", " wow");
 }
 
 test "lettersN success" {
@@ -487,42 +418,16 @@ test "lettersN success" {
             try testing.expectEqualStrings("hello", result.value());
             try testing.expectEqual(@as(usize, 5), result.consumed);
         },
-        .err => |_| try testing.expect(false),
+        .err => try testing.expect(false),
     }
 }
 
 test "lettersN overflow" {
-    const parser = lettersN(15);
-    switch (parser.run("helloworld")) {
-        .success => |_| try testing.expect(false),
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 0), e.index);
-            try testing.expect(std.mem.startsWith(u8, e.expected, "15"));
-        },
-    }
+    try expectErr(lettersN(15), "helloworld", 0, "letters", "helloworld");
 }
 
 test "lettersN not enough letters" {
-    const parser = lettersN(5);
-    switch (parser.run("hel12")) {
-        .success => |_| try testing.expect(false),
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 3), e.index);
-            try testing.expectEqualStrings("letter", e.expected);
-        },
-    }
-}
-
-test "digits" {
-    const parser = digits();
-    switch (parser.run("12345654321")) {
-        .success => |result| {
-            try testing.expectEqualStrings("12345654321", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
-        },
-    }
+    try expectErr(lettersN(5), "hel12", 3, "letter", "12");
 }
 
 test "digitsN success" {
@@ -532,92 +437,54 @@ test "digitsN success" {
             try testing.expectEqualStrings("123123", result.value());
             try testing.expectEqual(@as(usize, 6), result.consumed);
         },
-        .err => |_| try testing.expect(false),
+        .err => try testing.expect(false),
     }
 }
 
 test "digitsN overflow" {
-    const parser = digitsN(15);
-    switch (parser.run("12")) {
-        .success => |_| try testing.expect(false),
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 0), e.index);
-            try testing.expect(std.mem.startsWith(u8, e.expected, "15"));
-        },
-    }
+    try expectErr(digitsN(15), "12", 0, "digits", "12");
 }
 
-test "digitsN not enough letters" {
-    const parser = digitsN(5);
-    switch (parser.run("123AB")) {
-        .success => |_| try testing.expect(false),
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 3), e.index);
-            try testing.expectEqualStrings("digit", e.expected);
-        },
-    }
+test "digitsN not enough digits" {
+    try expectErr(digitsN(5), "123AB", 3, "digit", "AB");
 }
 
 test "choices" {
-    const parser = choice(&.{ str("hello"), str("world") });
-    switch (parser.run("hello")) {
-        .success => |result| {
-            try testing.expectEqualStrings("hello", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
-        },
-    }
+    try expectOk(choice(&.{ str("hello"), str("world") }), "hello", "hello");
 }
 
 test "choices fail" {
-    const parser = choice(&.{ str("hello"), str("world") });
-    switch (parser.run("alpha")) {
-        .success => |_| {
-            try testing.expect(false);
-        },
-        .err => |e| {
-            try testing.expectEqual(@as(usize, 0), e.index);
-            try testing.expectEqualStrings("hello", e.expected);
-        },
-    }
+    try expectErr(choice(&.{ str("hello"), str("world") }), "alpha", 0, "hello", "alpha");
 }
 
 test "many" {
-    const parser = many(&digitsN(1));
-    switch (parser.run("12345")) {
-        .success => |result| {
-            try testing.expectEqualStrings("12345", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
-        },
-    }
+    try expectOk(many(&digitsN(1)), "12345", "12345");
+}
+
+test "many1" {
+    try expectOk(many1(&digitsN(1)), "12345", "12345");
+}
+
+test "many1 requires at least one match" {
+    try expectErr(many1(&digitsN(1)), "abc", 0, "digit", "abc");
 }
 
 test "not" {
-    const parser = sequence(&.{ not(&str("XYZ")), letters() });
-    switch (parser.run("ABC")) {
-        .success => |result| {
-            try testing.expectEqualStrings("ABC", result.value());
-        },
-        .err => |_| {
-            try testing.expect(false);
-        },
-    }
+    try expectOk(sequence(&.{ not(&str("XYZ")), letters() }), "ABC", "ABC");
 }
 
+test "space" {
+    try expectOk(many(&space()), "   x", "   ");
+}
+
+const quote_char = str("\"");
+const not_quote_then_any = sequence(&.{ not(&quote_char), any() });
+const quoted_body = many(&not_quote_then_any);
+
 fn quotedString() Parser {
-    return sequence(&.{ str("\""), many(&sequence(&.{ not(&str("\"")), any() })), str("\"") });
+    return sequence(&.{ quote_char, quoted_body, quote_char });
 }
 
 test "lazy attribute success" {
-    const parser = sequence(&.{ letters(), str("="), lazy(quotedString) });
-
-    switch (parser.run("class=\"container\"")) {
-        .success => |result| {
-            try testing.expectEqualStrings("class=\"container\"", result.value());
-        },
-        .err => |_| try testing.expect(false),
-    }
+    try expectOk(sequence(&.{ letters(), str("="), lazy(quotedString) }), "class=\"container\"", "class=\"container\"");
 }
