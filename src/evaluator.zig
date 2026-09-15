@@ -250,12 +250,27 @@ const Eval = struct {
             .string => |v| .{ .string = v },
             .path => |path| evalPath(scope, path),
             .binary => |b| try self.evalBinary(scope, b),
+            .unary => |u| try self.evalUnary(scope, u),
             .call => |c| try self.evalCall(scope, c),
-            .range => error.TypeMismatch, // only meaningful directly as a for-loop iterable
+            .range => error.TypeMismatch, 
         };
     }
 
     fn evalBinary(self: *Eval, scope: *const Scope, b: ast.Expr.Binary) anyerror!Value {
+        switch (b.op) {
+            .logical_and => {
+                const lhs = try self.evalExpr(scope, b.lhs.*);
+                if (!lhs.truthy()) return .{ .boolean = false };
+                return .{ .boolean = (try self.evalExpr(scope, b.rhs.*)).truthy() };
+            },
+            .logical_or => {
+                const lhs = try self.evalExpr(scope, b.lhs.*);
+                if (lhs.truthy()) return .{ .boolean = true };
+                return .{ .boolean = (try self.evalExpr(scope, b.rhs.*)).truthy() };
+            },
+            else => {},
+        }
+
         const lhs = try self.evalExpr(scope, b.lhs.*);
         const rhs = try self.evalExpr(scope, b.rhs.*);
         return switch (b.op) {
@@ -263,12 +278,23 @@ const Eval = struct {
             .sub => .{ .int = try asInt(lhs) - try asInt(rhs) },
             .mul => .{ .int = try asInt(lhs) * try asInt(rhs) },
             .div => .{ .int = @divTrunc(try asInt(lhs), try asInt(rhs)) },
+            .floordiv => .{ .int = @divFloor(try asInt(lhs), try asInt(rhs)) },
+            .mod => .{ .int = @mod(try asInt(lhs), try asInt(rhs)) },
+            .pow => .{ .int = try intPow(try asInt(lhs), try asInt(rhs)) },
             .eq => .{ .boolean = lhs.eql(rhs) },
             .neq => .{ .boolean = !lhs.eql(rhs) },
             .lt => .{ .boolean = try asInt(lhs) < try asInt(rhs) },
             .lte => .{ .boolean = try asInt(lhs) <= try asInt(rhs) },
             .gt => .{ .boolean = try asInt(lhs) > try asInt(rhs) },
             .gte => .{ .boolean = try asInt(lhs) >= try asInt(rhs) },
+            .logical_and, .logical_or => unreachable,         };
+    }
+
+    fn evalUnary(self: *Eval, scope: *const Scope, u: ast.Expr.Unary) anyerror!Value {
+        const operand = try self.evalExpr(scope, u.operand.*);
+        return switch (u.op) {
+            .logical_not => .{ .boolean = !operand.truthy() },
+            .negate => .{ .int = -(try asInt(operand)) },
         };
     }
 
@@ -326,6 +352,14 @@ fn asInt(v: Value) anyerror!i64 {
     };
 }
 
+fn intPow(base: i64, exp: i64) anyerror!i64 {
+    if (exp < 0) return error.TypeMismatch;
+    var result: i64 = 1;
+    var i: i64 = 0;
+    while (i < exp) : (i += 1) result *= base;
+    return result;
+}
+
 fn writeFile(dir: std.fs.Dir, name: []const u8, contents: []const u8) !void {
     try dir.writeFile(.{ .sub_path = name, .data = contents });
 }
@@ -355,6 +389,39 @@ test "variables, arithmetic, and paths" {
     const out = try engine.render(testing.allocator, "index.html", &ctx);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("Ada is 36, item0=first, city=NYC", out);
+}
+
+test "and, or, not, %, //, **, and unary minus" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(
+        tmp.dir,
+        "t.html",
+        "{{if a and b}}AB{{end}}" ++
+            "{{if a or c}}A-or-C{{end}}" ++
+            "{{if not c}}not-C{{end}}" ++
+            "mod={{7 % 3}} floordiv={{-7 // 2}} pow={{2 ** 5}} " ++
+            "neg_lit={{-5}} neg_var={{-n}} neg_expr={{-(2 + 3)}} double_neg={{-(-n)}}",
+    );
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    var engine = try Engine.init(testing.allocator, path);
+    defer engine.deinit();
+
+    var ctx = Context.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("a", .{ .boolean = true });
+    try ctx.set("b", .{ .boolean = true });
+    try ctx.set("c", .{ .boolean = false });
+    try ctx.set("n", .{ .int = 5 });
+
+    const out = try engine.render(testing.allocator, "t.html", &ctx);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "ABA-or-Cnot-Cmod=1 floordiv=-4 pow=32 neg_lit=-5 neg_var=-5 neg_expr=-5 double_neg=5",
+        out,
+    );
 }
 
 test "if / elseif / else" {

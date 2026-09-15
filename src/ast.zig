@@ -2,7 +2,8 @@ const std = @import("std");
 const testing = std.testing;
 const p = @import("parser.zig");
 
-pub const BinOp = enum { add, sub, mul, div, eq, neq, lt, lte, gt, gte };
+pub const BinOp = enum { add, sub, mul, div, mod, floordiv, pow, eq, neq, lt, lte, gt, gte, logical_and, logical_or };
+pub const UnOp = enum { logical_not, negate };
 
 pub const Accessor = union(enum) {
     field: []const u8,
@@ -15,11 +16,13 @@ pub const Expr = union(enum) {
     string: []const u8,
     path: Path,
     binary: Binary,
+    unary: Unary,
     call: Call,
     range: Range,
 
     pub const Path = struct { name: []const u8, accessors: []const Accessor };
     pub const Binary = struct { op: BinOp, lhs: *const Expr, rhs: *const Expr };
+    pub const Unary = struct { op: UnOp, operand: *const Expr };
     pub const Call = struct { name: []const u8, args: []const Expr };
     pub const Range = struct { start: *const Expr, end: *const Expr };
 };
@@ -118,18 +121,9 @@ fn isIdentChar(c: u8) bool {
 }
 
 fn parseInt(state: *p.ParserState) Error!i64 {
-    const checkpoint = state.index;
-    var negative = false;
-    if (p.str("-").parse(state)) |_| {
-        negative = true;
-    } else |_| {}
-
-    const span = p.digits().parse(state) catch |err| {
-        state.index = checkpoint;
-        return err;
-    };
+    const span = try p.digits().parse(state);
     const value = std.fmt.parseInt(i64, span.slice(state.input), 10) catch return error.UnexpectedToken;
-    return if (negative) -value else value;
+    return value;
 }
 
 fn parsePrimary(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
@@ -266,11 +260,37 @@ fn parseBinaryLevel(
     return lhs;
 }
 
+// Applies to any primary, not just int literals: -x, -(a + b), -foo().
+fn parseUnaryMinus(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
+    skipWs(state);
+    const checkpoint = state.index;
+    if (p.str("-").parse(state)) |_| {
+        skipWs(state);
+        const operand = try parseUnaryMinus(allocator, state); // allow chaining "--x"
+        const operand_ptr = try allocator.create(Expr);
+        operand_ptr.* = operand;
+        return Expr{ .unary = .{ .op = .negate, .operand = operand_ptr } };
+    } else |_| {
+        state.index = checkpoint;
+    }
+    return parsePrimary(allocator, state);
+}
+
+fn parsePower(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
+    return parseBinaryLevel(allocator, state, &.{
+        .{ .text = "**", .op = .pow },
+    }, parseUnaryMinus);
+}
+
 fn parseMultiplicative(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
     return parseBinaryLevel(allocator, state, &.{
+        // "//" must be tried before "/" -- a single slash would otherwise
+        // match and leave a stray "/" for the next token to trip over.
+        .{ .text = "//", .op = .floordiv },
         .{ .text = "*", .op = .mul },
         .{ .text = "/", .op = .div },
-    }, parsePrimary);
+        .{ .text = "%", .op = .mod },
+    }, parsePower);
 }
 
 fn parseAdditive(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
@@ -304,13 +324,51 @@ fn parseComparison(allocator: std.mem.Allocator, state: *p.ParserState) Error!Ex
     return lhs;
 }
 
+// not binds tighter than and/or but looser than comparisons, e.g.
+// `not a == b` reads as `not (a == b)`, and `a and not b` reads as expected.
+fn parseNot(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
+    skipWs(state);
+    if (keyword(state, "not")) {
+        skipWs(state);
+        const operand = try parseNot(allocator, state); // allow chaining "not not x"
+        const operand_ptr = try allocator.create(Expr);
+        operand_ptr.* = operand;
+        return Expr{ .unary = .{ .op = .logical_not, .operand = operand_ptr } };
+    }
+    return parseComparison(allocator, state);
+}
+
+fn parseAnd(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
+    var lhs = try parseNot(allocator, state);
+    while (true) {
+        skipWs(state);
+        if (!keyword(state, "and")) break;
+        skipWs(state);
+        const rhs = try parseNot(allocator, state);
+        lhs = try makeBinary(allocator, .logical_and, lhs, rhs);
+    }
+    return lhs;
+}
+
+fn parseOr(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
+    var lhs = try parseAnd(allocator, state);
+    while (true) {
+        skipWs(state);
+        if (!keyword(state, "or")) break;
+        skipWs(state);
+        const rhs = try parseAnd(allocator, state);
+        lhs = try makeBinary(allocator, .logical_or, lhs, rhs);
+    }
+    return lhs;
+}
+
 fn parseExpr(allocator: std.mem.Allocator, state: *p.ParserState) Error!Expr {
-    const lhs = try parseComparison(allocator, state);
+    const lhs = try parseOr(allocator, state);
     skipWs(state);
     const checkpoint = state.index;
     if (p.str("..").parse(state)) |_| {
         skipWs(state);
-        const rhs = try parseComparison(allocator, state);
+        const rhs = try parseOr(allocator, state);
         const lhs_ptr = try allocator.create(Expr);
         lhs_ptr.* = lhs;
         const rhs_ptr = try allocator.create(Expr);
@@ -586,6 +644,59 @@ test "variable: plain, indexed, nested, arithmetic, bool" {
     {
         const t = try parseFixture(a, "{{ true }}");
         try testing.expectEqual(true, t.nodes[0].output.boolean);
+    }
+}
+
+test "logical and arithmetic operators, with precedence" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        // "**" binds tighter than "+": 2 + (3 ** 2)
+        const t = try parseFixture(a, "{{ 2 + 3 ** 2 }}");
+        const bin = t.nodes[0].output.binary;
+        try testing.expectEqual(BinOp.add, bin.op);
+        try testing.expectEqual(@as(i64, 2), bin.lhs.int);
+        try testing.expectEqual(BinOp.pow, bin.rhs.binary.op);
+    }
+    {
+        const t = try parseFixture(a, "{{ 7 // 2 }}");
+        try testing.expectEqual(BinOp.floordiv, t.nodes[0].output.binary.op);
+    }
+    {
+        const t = try parseFixture(a, "{{ 7 % 2 }}");
+        try testing.expectEqual(BinOp.mod, t.nodes[0].output.binary.op);
+    }
+    {
+        // "not" binds tighter than "and"/"or": (not a) and b
+        const t = try parseFixture(a, "{{ not a and b }}");
+        const bin = t.nodes[0].output.binary;
+        try testing.expectEqual(BinOp.logical_and, bin.op);
+        try testing.expectEqual(UnOp.logical_not, bin.lhs.unary.op);
+        try testing.expectEqualStrings("a", bin.lhs.unary.operand.path.name);
+        try testing.expectEqualStrings("b", bin.rhs.path.name);
+    }
+    {
+        // unary minus applies to any primary, not just int literals
+        const t = try parseFixture(a, "{{ -x }}");
+        const u = t.nodes[0].output.unary;
+        try testing.expectEqual(UnOp.negate, u.op);
+        try testing.expectEqualStrings("x", u.operand.path.name);
+    }
+    {
+        // unary minus binds tighter than "**": (-2) ** 2
+        const t = try parseFixture(a, "{{ -2 ** 2 }}");
+        const bin = t.nodes[0].output.binary;
+        try testing.expectEqual(BinOp.pow, bin.op);
+        try testing.expectEqual(UnOp.negate, bin.lhs.unary.op);
+        try testing.expectEqual(@as(i64, 2), bin.lhs.unary.operand.int);
+    }
+    {
+        // "and" binds tighter than "or": a or (b and c)
+        const t = try parseFixture(a, "{{ a or b and c }}");
+        const bin = t.nodes[0].output.binary;
+        try testing.expectEqual(BinOp.logical_or, bin.op);
+        try testing.expectEqual(BinOp.logical_and, bin.rhs.binary.op);
     }
 }
 
